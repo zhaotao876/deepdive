@@ -559,7 +559,7 @@ class fossil_simulator():
                        sp_x,
                        min_age=None,
                        max_age=None,
-                       return_sqs_data=True,
+                       return_sqs_data=False,
                        area_specific_rate=None,
                        time_specific_rate=None):
 

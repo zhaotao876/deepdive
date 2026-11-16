@@ -105,7 +105,7 @@ def run_sim(args):
             # quit()
             fossil_sim.set_carrying_capacity_multiplier(m_species_origin=c1, m_sp_area_time=c2)
 
-        sim = fossil_sim.run_simulation(sp_x, min_age=settings_obj.min_age, max_age=settings_obj.max_age)
+        sim = fossil_sim.run_simulation(sp_x, min_age=settings_obj.min_age, max_age=settings_obj.max_age, return_sqs_data=False)
         if np.sum(sim['fossil_data']) >= settings_obj.min_n_occurrences:
             sim_features = extract_sim_features(sim,
                                                 include_present_div=settings_obj.include_present_diversity)
