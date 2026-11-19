@@ -29,24 +29,96 @@ class FeatureRescaler(object):
         return x_r
 
 
-def calculate_global_trajectory(species_space_time):
-    # a 3D array with species, areas and time bins.
-    temp = np.einsum('sat -> st', species_space_time)  # sum over areas
-    x = temp + 0   # temp > 0
-    x[temp > 1] = 1
+def _accumulate_reduce(chunks, out_shape, dtype=None):
+    """Sum an array over its first axis, in chunks, reproducing the exact
+    floating point result of ``np.einsum('sat -> at', arr)``.
 
-    return np.einsum('st -> t', x)  # set to float and not integer for low res dating features
+    ``np.einsum`` reduces over the species axis *sequentially*, i.e. it computes
+    ``((x0 + x1) + x2) + ...``. A block-wise ``chunk.sum(axis=0)`` instead
+    computes ``(x0 + ... + xk) + (xk+1 + ... + xn)``, which rounds differently
+    and produces results that differ in the last few bits.
+
+    ``np.add.accumulate`` along axis 0 performs exactly the sequential
+    additions that einsum performs. To continue the same accumulation chain
+    across a chunk boundary, the running total is placed in row 0 of the
+    buffer before accumulating, so that the last row of the buffer holds
+    ``((total + x0) + x1) + ... + xn`` -- exactly the value einsum would
+    produce for the whole array.
+
+    Parameters
+    ----------
+    chunks : iterable of ndarray
+        Arrays of shape (n, ...) to be summed over their first axis, in order.
+    out_shape : tuple
+        Shape of the reduced result (the trailing shape of the chunks).
+    dtype : dtype, optional
+        Accumulation dtype. If None, the dtype of the first chunk is used,
+        which keeps the result dtype identical to that of the corresponding
+        einsum call.
+    """
+    acc = None
+    for c in chunks:
+        if acc is None:
+            if dtype is None:
+                dtype = c.dtype
+            acc = np.zeros(out_shape, dtype=dtype)
+        buf = np.empty((c.shape[0] + 1,) + tuple(c.shape[1:]), dtype=dtype)
+        buf[0] = acc
+        buf[1:] = c
+        # out=buf keeps the accumulation in place, avoiding a second buffer.
+        np.add.accumulate(buf, axis=0, out=buf)
+        acc = buf[-1].copy()
+    return acc
+
+
+# [PERF 2026-11-19] Number of species processed at a time when a
+# (n_species x n_areas x n_time_bins) array is reduced in pieces instead of
+# all at once. It only affects memory usage, not the results.
+TRAJECTORY_CHUNK_SIZE = 25000
+
+
+def calculate_global_trajectory(species_space_time, chunk_size=TRAJECTORY_CHUNK_SIZE):
+    # a 3D array with species, areas and time bins.
+    # [PERF 2026-11-19] Reduced in chunks along the species axis so that the
+    # full size array never has to be copied. The result is bitwise identical
+    # to the previous, single-shot implementation.
+    def gen():
+        for lo in range(0, species_space_time.shape[0], chunk_size):
+            hi = min(lo + chunk_size, species_space_time.shape[0])
+            c = species_space_time[lo:hi]
+            temp = np.einsum('sat -> st', c)  # sum over areas
+            x = temp + 0   # temp > 0
+            x[temp > 1] = 1
+            yield x
+
+    # set to float and not integer for low res dating features
+    # The dtype is that of the summed array, i.e. the dtype of the input
+    # (einsum preserves it), so that the result is unchanged.
+    return _accumulate_reduce(gen(), (species_space_time.shape[2],),
+                              dtype=species_space_time.dtype)
 
 
 def calculate_sampled_turnover(species_space_time=None):
     species_space_time = np.random.binomial(1, 0.5, size=(5, 10))
 
 
-def calculate_local_trajectory(species_space_time):
+def calculate_local_trajectory(species_space_time, chunk_size=TRAJECTORY_CHUNK_SIZE):
     # return a 2D matrix, areas by time bins
-    x = species_space_time + 0  # turn n. of occs per species per area > 1 to 1
-    x[x > 1] = 1
-    return np.einsum('sat -> at', x.astype(float))
+    # [PERF 2026-11-19] Reduced in chunks along the species axis. The previous
+    # implementation made two full size copies of the input array (one from
+    # ``species_space_time + 0`` and one from ``.astype(float)``), which was
+    # the largest memory consumer of the simulation. The result is bitwise
+    # identical to the previous implementation.
+    def gen():
+        for lo in range(0, species_space_time.shape[0], chunk_size):
+            hi = min(lo + chunk_size, species_space_time.shape[0])
+            c = species_space_time[lo:hi]
+            x = c + 0  # turn n. of occs per species per area > 1 to 1
+            x[x > 1] = 1
+            yield x.astype(float)
+
+    return _accumulate_reduce(gen(), (species_space_time.shape[1], species_space_time.shape[2]),
+                              dtype=np.float64)
 
 
 ###---- start 1D FEATURES ----###
