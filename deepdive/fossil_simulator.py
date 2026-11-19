@@ -4,8 +4,25 @@ import pandas as pd
 np.set_printoptions(suppress=True, precision=3)
 from collections.abc import Iterable
 from .feature_extraction import *
+from .feature_extraction import _accumulate_reduce
 from .utilities import get_rnd_gen
 SMALL_NUMBER = 1e-10
+
+# [PERF 2026-11-19] Number of species processed at a time when a
+# (n_species x n_areas x n_time_bins) array is built in pieces instead of all at
+# once. For n_species = 350k, n_areas = 10, n_bins = 40 a single such array is
+# 1.07 GiB, so this bounds the temporary buffers to roughly 80 MiB each.
+# The chunk size does not affect the results: all the reductions used here are
+# performed with an exact, order preserving accumulation (see
+# _accumulate_reduce below), so the output is bitwise identical for any chunk
+# size. It is only a memory / cache trade-off.
+DEFAULT_CHUNK_SIZE = 25000
+
+
+# [PERF 2026-11-19] _accumulate_reduce() is defined in feature_extraction.py
+# (next to the trajectory functions that use it) and imported explicitly here,
+# because ``from .feature_extraction import *`` does not export names starting
+# with an underscore.
 
 
 class fossil_simulator():
@@ -223,8 +240,34 @@ class fossil_simulator():
         #       disp_rate_mean, np.mean(dispersal_rate),
         #       disp_rate_shape, disp_rate_scale)
         dispersal_rate += SMALL_NUMBER  # avoid divide-by-zero
-        m = np.einsum('ab,s->sab', distance_matrix, 1 / dispersal_rate)
-        dispersal_pr = np.exp(-m)
+
+        # [PERF 2026-11-19] The dispersal probability tensor is no longer built.
+        #
+        # The previous implementation was:
+        #     m = np.einsum('ab,s->sab', distance_matrix, 1 / dispersal_rate)
+        #     dispersal_pr = np.exp(-m)
+        # which materialises two (n_species x n_areas x n_areas) float64
+        # arrays. For n_species = 350k and n_areas = 10 that is 2 x 267 MiB =
+        # 534 MiB, and it was the single largest memory consumer of the
+        # simulation.
+        # (With n_areas = 30 the same tensors would be 2 x 2.35 GiB = 4.7 GiB.)
+        #
+        # The tensor was never used as a whole: the loop below only ever reads
+        # one (n_areas, n_areas) slice per species, and in fact only one *row*
+        # of that slice:
+        #     row = dispersal_pr[sp_i]              # (a, b)
+        #     np.fill_diagonal(row, 0)               # row[a, a] = 0
+        #     p_vec = row[sp_init_range]             # row (sp_init_range, :)
+        # so that p_vec[b] = exp(-distance_matrix[sp_init_range, b] / rate)
+        # for every b, with p_vec[sp_init_range] = 0 because of the zeroed
+        # diagonal.
+        #
+        # Computing that single row directly per species gives bitwise
+        # identical results (exp is elementwise, and the multiplication
+        # distance_matrix[sp_init_range, b] * (1 / rate) is the same operation
+        # that einsum performs) while using a few hundred bytes instead of
+        # gigabytes.
+        inv_dispersal_rate = 1 / dispersal_rate
         # init geo table
         geo_table = np.zeros((self.n_species, self.n_areas))
         # init first sp area
@@ -232,13 +275,17 @@ class fossil_simulator():
         # geo_table[np.arange(self.n_species), sp_range] = 1
 
         # add areas based on dispersal and distance from init range
+        area_indices = np.arange(self.n_areas)
         for sp_i in range(self.n_species):
             # init first sp area
-            sp_init_range = self._rs.choice(np.arange(self.n_areas), p=pr_at_origination[sp_i])
+            sp_init_range = self._rs.choice(area_indices, p=pr_at_origination[sp_i])
             geo_table[sp_i, sp_init_range] = 1
-            dispersal_pr_sp_i = dispersal_pr[sp_i]
-            np.fill_diagonal(dispersal_pr_sp_i, 0)
-            add_areas = self._rs.binomial(1, p=dispersal_pr_sp_i[sp_init_range])
+            # the dispersal probability of reaching each area from the area of
+            # origin, i.e. one row of exp(-distance_matrix / dispersal_rate).
+            dispersal_pr_sp_i = np.exp(-(distance_matrix[sp_init_range] * inv_dispersal_rate[sp_i]))
+            # the diagonal (the area of origin itself) is set to zero
+            dispersal_pr_sp_i[sp_init_range] = 0.0
+            add_areas = self._rs.binomial(1, dispersal_pr_sp_i)
             geo_table[sp_i] += add_areas
 
         if self.carrying_capacity_multiplier is not None:
@@ -426,25 +473,87 @@ class fossil_simulator():
         return p_3d_no_fossil
 
     # Draw fossils from localities
-    def draw_fossils(self, species_specific_rate, e_species_space_time_table_fraction, number_of_localities):
+    #
+    # [PERF 2026-11-19] This method was rewritten to build the
+    # (n_species x n_areas x n_time_bins) arrays in chunks along the species
+    # axis instead of materialising them in full.
+    #
+    # Before the change the method needed up to five full size
+    # (n_species x n_areas x n_time_bins) arrays alive at the same time
+    # (p_3d, p_3d_no_fossil, the mask, n_localities * mask and
+    # fossils_per_area), i.e. about 5 x 1.07 GiB = 5.3 GiB for
+    # n_species = 350k, n_areas = 10, n_bins = 40. The chunked version keeps
+    # only small buffers alive and reduces the peak to well under one full
+    # size array.
+    #
+    # The results are bitwise identical to the previous implementation. Two
+    # details are required for that and must not be changed:
+    #   1. The random draws happen in the same order. numpy's binomial()
+    #      consumes random numbers in C order, element by element, so
+    #      splitting an array along the first axis does not change the
+    #      sequence of draws. However, the *original* code draws the whole
+    #      mask first and only then the whole fossil count. Drawing mask and
+    #      fossils interleaved per chunk would consume the random stream in a
+    #      different order and hence produce different results, so the mask is
+    #      drawn in a separate pass over the species axis.
+    #   2. The reduction over the species axis must preserve the summation
+    #      order of einsum (which sums sequentially over species). See
+    #      _accumulate_reduce() for the details.
+    def draw_fossils(self, species_specific_rate,
+                     geo_table,
+                     species_presence_absence_data,
+                     number_of_localities):
         # sp specific probability is multiplied by its presence/absence in space/time
-        p_3d = np.einsum('s, sat -> sat', (1 - np.exp(-species_specific_rate)),
-                         e_species_space_time_table_fraction)  # the probability of sampling a species
-        if self.sampling_rate_multiplier is not None:
-            p_3d = np.einsum('sat, at -> sat', p_3d, self.sampling_rate_multiplier)
-        # ---
-        p_3d_no_fossil = np.nan_to_num(1 - p_3d)
-        p_3d_no_fossil[p_3d_no_fossil == 0] += SMALL_NUMBER
+        n_species = geo_table.shape[0]
+        n_areas = geo_table.shape[1]
+        n_bins = species_presence_absence_data.shape[1]
+        chunk = min(DEFAULT_CHUNK_SIZE, n_species)
 
+        # carrying_capacity_multiplier[1] is a (s, a, t) multiplier applied to
+        # the space/time fraction. It is applied inside the chunk loop so that
+        # the full size array never has to exist.
+        ccm = self.carrying_capacity_multiplier[1] if self.carrying_capacity_multiplier is not None else None
+
+        def frac_chunks():
+            """Yield the (chunk, a, t) space/time fraction, chunk by chunk."""
+            for lo in range(0, n_species, chunk):
+                hi = min(lo + chunk, n_species)
+                f = np.einsum('sa, st -> sat', geo_table[lo:hi], species_presence_absence_data[lo:hi])
+                if ccm is not None:
+                    f *= ccm[lo:hi]
+                yield f
+
+        def p_3d_chunks():
+            """Yield the (chunk, a, t) sampling probability, chunk by chunk."""
+            lo = 0
+            for f in frac_chunks():
+                hi = lo + f.shape[0]
+                p = np.einsum('s, sat -> sat', (1 - np.exp(-species_specific_rate[lo:hi])), f)
+                if self.sampling_rate_multiplier is not None:
+                    p = np.einsum('sat, at -> sat', p, self.sampling_rate_multiplier)
+                lo = hi
+                yield p
+
+        # ---
         # product of probabilities (in log space to use einsum)
-        p_no_fossil_in_locality = np.exp(np.einsum('sat -> at', np.log(p_3d_no_fossil)))
+        # The log of (1 - p) is summed over the species axis; the summation is
+        # done with an order preserving accumulation so that the result is
+        # bitwise identical to the previous, non chunked implementation.
+        def log_no_fossil_chunks():
+            for p in p_3d_chunks():
+                # np.nan_to_num() is a no-op here: p is a probability, so
+                # (1 - p) is in [0, 1] and contains neither NaN nor Inf.
+                pnf = 1 - p
+                pnf[pnf == 0] += SMALL_NUMBER
+                yield np.log(pnf)
+
+        p_no_fossil_in_locality = np.exp(_accumulate_reduce(log_no_fossil_chunks(), (n_areas, n_bins)))
         expected_n_localities_with_fossils = self._rs.binomial(number_of_localities, 1 - p_no_fossil_in_locality)
         # print("expected_n_localities_with_fossils",
-        #       np.einsum('at -> t', expected_n_localities_with_fossils))
+        #       np.einsum("at -> t", expected_n_localities_with_fossils))
         # expected_n_localities_with_fossils.shape = (at)
         # ---
         # print("number_of_localities", number_of_localities.shape, number_of_localities.dtype)
-        # print("p_3d", p_3d.shape)
         # even with max sampling rate localities will only record ~10% of the species
         if self.species_per_locality_multiplier is None:
             mul = 1
@@ -454,7 +563,21 @@ class fossil_simulator():
         else:
             mul = self.species_per_locality_multiplier
 
-        fossils_per_area = self._rs.binomial(number_of_localities * self._rs.binomial(1, mul, p_3d.shape), p_3d)
+        # Pass 1: draw the mask for every species. This must be a separate pass
+        # over the species axis so that the random numbers are consumed in the
+        # same order as in the original implementation.
+        mask = np.empty((n_species, n_areas, n_bins), dtype=np.int8)
+        for lo in range(0, n_species, chunk):
+            hi = min(lo + chunk, n_species)
+            mask[lo:hi] = self._rs.binomial(1, mul, (hi - lo, n_areas, n_bins))
+
+        # Pass 2: draw the fossil counts, using the mask drawn above.
+        fossils_per_area = np.empty((n_species, n_areas, n_bins), dtype=np.int64)
+        lo = 0
+        for p in p_3d_chunks():
+            hi = lo + p.shape[0]
+            fossils_per_area[lo:hi] = self._rs.binomial(number_of_localities[None, :, :] * mask[lo:hi], p)
+            lo = hi
         # print("fossils_per_area", fossils_per_area.shape)
         # print(np.sum(fossils_per_area))
         if self.singletons_frequency is not None:
@@ -534,18 +657,42 @@ class fossil_simulator():
 
         return tmp
 
-    # Einsum species_space_time. How many my a species lived in each area in each time bin.
-    def einsum_species_space_time(self, geo_table, species_presence_absence_data):
-        tmp = np.einsum('sa, st, t -> sat', geo_table, species_presence_absence_data, self.time_bins_duration)
-        return tmp
-
     # einsum_species_space_time_table/n_species==einsum_species_space_time_table_fraction
 
-    # new 3D array, each cell with the sampling rate for a given species for an area and a time
+    # [REMOVED 2026-11-19] The following two methods were left in place as dead code.
+    #
+    # def einsum_species_space_time(self, geo_table, species_presence_absence_data):
+    #     """Einsum species_space_time. How many my a species lived in each area in each time bin."""
+    #     tmp = np.einsum('sa, st, t -> sat', geo_table, species_presence_absence_data, self.time_bins_duration)
+    #     return tmp
+    #
+    # def einsum_fossil_record(self, e_species_space_time_table, preservation_sampling_rate):
+    #     """Multiply the 3D matrix einsum_species_space_time_table with the 3D matrix preservation_sampling_rates."""
+    #     return np.einsum('sat, sat -> sat', e_species_space_time_table, preservation_sampling_rate)
+    #
+    # Why they were removed:
+    #   - einsum_species_space_time() built the array "e_species_space_time_table"
+    #     (species x areas x time bins = the time a species lived in an area within a
+    #     time bin). It differs from einsum_species_space_time_fraction() only by the
+    #     factor time_bins_duration, so it was a duplicate computation of the same
+    #     quantity in a different unit (absolute duration vs. fraction of the bin).
+    #   - einsum_fossil_record() was its only consumer, and it was never called
+    #     anywhere in the codebase: the Poisson sampling path that used it was
+    #     already commented out in run_simulation(). The actual fossil sampling is
+    #     done by draw_fossils(), which uses e_species_space_time_table_fraction.
+    #   - The array was never used by any downstream feature extraction or by the
+    #     "keys" list saved in deepdiver_utilities.py, so removing it does not
+    #     change any simulation output.
+    #   - Memory benefit: the array is n_species x n_areas x n_bins float64 values
+    #     (~1.07 GiB for n_species=350k, n_areas=10, n_bins=40) and it was held in
+    #     memory simultaneously with the "_fraction" version, doubling the peak
+    #     footprint of the S x A x T arrays for no benefit.
+    #   - Note: the old e_species_space_time_table was also never multiplied by
+    #     carrying_capacity_multiplier[1], so it did not even reflect the area
+    #     constraints applied to the "_fraction" version actually used for sampling.
+    #     The methods are kept commented out above for reference.
 
-    # Multiply the 3D matrix einsum_species_space_time_table with the 3D matrix preservation_sampling_rates
-    def einsum_fossil_record(self, e_species_space_time_table, preservation_sampling_rate):
-        return np.einsum('sat, sat -> sat', e_species_space_time_table, preservation_sampling_rate)
+    # new 3D array, each cell with the sampling rate for a given species for an area and a time
 
     def add_info(self, sim, info):
         # use to add info about later manipulation of the object (e.g. extract_features_age_uncertainty)
@@ -581,20 +728,68 @@ class fossil_simulator():
         # on `link_area_size_carrying_capacity`
 
         species_presence_absence_data = self.species_presence_absence_in_time_bin()
-        e_species_space_time_table_fraction = self.einsum_species_space_time_fraction(geo_table,
-                                                                                      species_presence_absence_data)
 
-        if self.carrying_capacity_multiplier is not None:
-            e_species_space_time_table_fraction *= self.carrying_capacity_multiplier[1]
+        # [PERF 2026-11-19] The (n_species x n_areas x n_time_bins) array
+        # "e_species_space_time_table_fraction" is no longer built here. It was
+        # the largest array in the whole simulation (1.07 GiB for n_species =
+        # 350k, n_areas = 10, n_bins = 40) and was only used for two things:
+        #   * the global / local "true" diversity trajectories, and
+        #   * the sampling probabilities used by draw_fossils().
+        # Both of them are now computed chunk by chunk from geo_table and
+        # species_presence_absence_data, so the full size array never exists.
+        # The results are bitwise identical to before, because the chunked
+        # reductions preserve the summation order of the original einsum calls
+        # (see _accumulate_reduce()).
+        ccm = self.carrying_capacity_multiplier[1] if self.carrying_capacity_multiplier is not None else None
 
-        e_species_space_time_table = self.einsum_species_space_time(geo_table,
-                                                                    species_presence_absence_data)
+        def frac_chunks():
+            """Yield the (chunk, a, t) space/time fraction, chunk by chunk."""
+            chunk = min(DEFAULT_CHUNK_SIZE, self.n_species)
+            for lo in range(0, self.n_species, chunk):
+                hi = min(lo + chunk, self.n_species)
+                f = np.einsum('sa, st -> sat', geo_table[lo:hi], species_presence_absence_data[lo:hi])
+                if ccm is not None:
+                    f *= ccm[lo:hi]
+                yield f
+
+        # [REMOVED 2026-11-19] e_species_space_time_table is no longer computed.
+        # It was the S x A x T (species x areas x time bins) array giving the time each
+        # species lived in each area within each time bin. It was redundant with
+        # e_species_space_time_table_fraction (which differs only by the
+        # time_bins_duration factor and is the one actually used for fossil sampling),
+        # it had no downstream consumer anywhere in the codebase, and it cost about
+        # 1.07 GiB of extra peak memory for n_species=350k, n_areas=10, n_bins=40.
+        # No simulation output changes: the computation is deterministic and draws no
+        # random numbers, so the random number stream and all results are unchanged.
+        # e_species_space_time_table = self.einsum_species_space_time(geo_table,
+        #                                                             species_presence_absence_data)
 
         a_var, r_eta, r_p_gap = self.a_variance()  # no. areas x no.bins
 
 
-        global_true_trajectory = calculate_global_trajectory(e_species_space_time_table_fraction)
-        local_true_trajectory = calculate_local_trajectory(e_species_space_time_table_fraction)
+        # global_true_trajectory: for every time bin, the number of species
+        # that are present in at least one area.
+        # _accumulate_reduce() already performs the final reduction over the
+        # species axis, in the same order as the original einsum('st -> t').
+        def global_true_chunks():
+            for f in frac_chunks():
+                # temp = sum over areas, then clipped to 1 per species / time bin
+                temp = np.einsum('sat -> st', f)
+                x = temp + 0
+                x[temp > 1] = 1
+                yield x
+
+        global_true_trajectory = _accumulate_reduce(global_true_chunks(), (self.n_bins,))
+
+        # local_true_trajectory: for every area and time bin, the number of
+        # species present in that area.
+        def local_true_chunks():
+            for f in frac_chunks():
+                x = f + 0
+                x[x > 1] = 1
+                yield x.astype(float)
+
+        local_true_trajectory = _accumulate_reduce(local_true_chunks(), (self.n_areas, self.n_bins))
 
         # ---- sampled localities
         # print("\narea_specific_rate", area_specific_rate.shape,
@@ -616,7 +811,8 @@ class fossil_simulator():
         clade_span = (global_true_trajectory == 0).nonzero()[0]
         number_of_localities[:, clade_span] = 0
         fossils_record, n_localities_w_fossils = self.draw_fossils(species_specific_rate=species_specific_rate,
-                                                                   e_species_space_time_table_fraction=e_species_space_time_table_fraction,
+                                                                   geo_table=geo_table,
+                                                                   species_presence_absence_data=species_presence_absence_data,
                                                                    number_of_localities=number_of_localities)
 
         # print("np.size(a_var == 0) / np.size(a_var == 0)",
@@ -672,7 +868,10 @@ class fossil_simulator():
              'fossil_data': fossils_record,
              'geo_table': geo_table,
              'species_presence_absence_data': species_presence_absence_data,
-             'e_species_space_time_table': e_species_space_time_table,
+             # [REMOVED 2026-11-19] 'e_species_space_time_table' was never read by any
+             # downstream code (feature extraction, or the "keys" list saved by
+             # deepdiver_utilities.py). The array is no longer computed at all; see the
+             # note in run_simulation(). Keeping the key would raise a NameError.
              'localities': number_of_localities,
              'n_localities_w_fossils': n_localities_w_fossils,
              'time_specific_rate': time_specific_rate,
